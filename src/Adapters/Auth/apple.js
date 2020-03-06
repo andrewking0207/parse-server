@@ -2,52 +2,50 @@
 // https://developer.apple.com/documentation/signinwithapplerestapi
 
 const Parse = require('parse/node').Parse;
-const httpsRequest = require('./httpsRequest');
-const NodeRSA = require('node-rsa');
+const jwksClient = require('jwks-rsa');
+const util = require('util');
 const jwt = require('jsonwebtoken');
 
 const TOKEN_ISSUER = 'https://appleid.apple.com';
 
-let currentKey;
+const getAppleKeyByKeyId = async (keyId, cacheMaxEntries, cacheMaxAge) => {
+  const client = jwksClient({
+    jwksUri: `${TOKEN_ISSUER}/auth/keys`,
+    cache: true,
+    cacheMaxEntries,
+    cacheMaxAge,
+  });
 
-const getApplePublicKey = async keyId => {
-  let data;
+  const asyncGetSigningKeyFunction = util.promisify(client.getSigningKey);
+
+  let key;
   try {
-    data = await httpsRequest.get('https://appleid.apple.com/auth/keys');
-  } catch (e) {
-    if (currentKey) {
-      return currentKey;
-    }
-    throw e;
+    key = await asyncGetSigningKeyFunction(keyId);
+  } catch (error) {
+    throw new Parse.Error(
+      Parse.Error.OBJECT_NOT_FOUND,
+      `Unable to find matching key for Key ID: ${keyId}`
+    );
   }
-
-  const key = data.keys.find(key => key.kid === keyId);
-
-  if (!key) {
-    throw Error('Public key with matching key ID to token not found');
-  }
-
-  const pubKey = new NodeRSA();
-  pubKey.importKey(
-    { n: Buffer.from(key.n, 'base64'), e: Buffer.from(key.e, 'base64') },
-    'components-public'
-  );
-  currentKey = pubKey.exportKey(['public']);
-  return currentKey;
+  return key;
 };
 
-const getKeyAndAlgoFromToken = token => {
+const getHeaderFromToken = token => {
   const decodedToken = jwt.decode(token, { complete: true });
   if (!decodedToken) {
     throw Error('provided token does not decode as JWT');
   }
-  const keyId = decodedToken.header.kid;
-  const algo = decodedToken.header.alg;
-
-  return { keyId, algo };
+  return decodedToken.header;
 };
 
-const verifyIdToken = async ({ token, id }, clientID) => {
+const ONE_HOUR_IN_MS = 3600000;
+
+const verifyIdToken = async (
+  { token, id },
+  clientID,
+  cacheMaxEntries,
+  cacheMaxAge
+) => {
   if (!token) {
     throw new Parse.Error(
       Parse.Error.OBJECT_NOT_FOUND,
@@ -55,10 +53,15 @@ const verifyIdToken = async ({ token, id }, clientID) => {
     );
   }
 
-  const decodedToken = getKeyAndAlgoFromToken(token);
-  const applePublicKey = await getApplePublicKey(decodedToken.keyId);
-  const jwtClaims = jwt.verify(token, applePublicKey, {
-    algorithms: decodedToken.algo,
+  const { kid: keyId, alg: algorithm } = getHeaderFromToken(token);
+  const appleKey = await getAppleKeyByKeyId(
+    keyId,
+    cacheMaxEntries,
+    cacheMaxAge
+  );
+  const signingKey = appleKey.publicKey || appleKey.rsaPublicKey;
+  const jwtClaims = jwt.verify(token, signingKey, {
+    algorithms: algorithm,
   });
 
   if (jwtClaims.iss !== TOKEN_ISSUER) {
@@ -83,8 +86,16 @@ const verifyIdToken = async ({ token, id }, clientID) => {
 };
 
 // Returns a promise that fulfills if this id token is valid
-function validateAuthData(authData, options = {}) {
-  return verifyIdToken(authData, options.client_id);
+function validateAuthData(
+  authData,
+  options = { cacheMaxEntries: 5, cacheMaxAge: ONE_HOUR_IN_MS }
+) {
+  return verifyIdToken(
+    authData,
+    options.client_id,
+    options.cacheMaxEntries,
+    options.cacheMaxAge
+  );
 }
 
 // Returns a promise that fulfills if this app id is valid.
